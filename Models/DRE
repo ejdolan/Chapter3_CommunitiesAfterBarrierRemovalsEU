@@ -1,0 +1,151 @@
+#### ============================================================
+#### DRE MODELS — FINAL, AS REPORTED
+#### Chapter 3 — European Connectivity (Invertebrates)
+#### ============================================================
+####
+#### Fits the three DRE models reported in this chapter:
+####   DRE2i — Native taxon richness (primary response, Section 3.2.2)
+####           Full nested random-effect structure (country, basin,
+####           site, method, year); justified via LOO against a
+####           site-only alternative (elpd_diff = -132.2, se = 14.3;
+####           see Table S8).
+####   DRE1i — Total taxon richness (robustness check, Supplementary).
+####           Identical structure to DRE2i.
+####   DRE3i — Proportion of non-native taxa, denominator = total
+####           richness (primary response, Section 3.2.3). Uses a
+####           SITE-ONLY random effect and a reduced covariate set
+####           (no AMBER-style climate/population/river-length
+####           covariates), and df=2 rather than df=3 for the time
+####           spline. This simpler design was retained after an
+####           expanded version (matching DRE2i's full structure)
+####           showed poor precision on this smaller, sparser
+####           response — see Methods 2.5.2 for the full rationale.
+####
+#### Requires the model-ready .rds files built by
+#### 02_prepare_dre_data_v2_FINAL.R:
+####   DRE1i_TotalRichnessBaseline_data.rds
+####   DRE2i_NativeRichnessBaseline_data.rds
+####   DRE3i_PropTotalBaseline_data.rds
+####
+#### Usage: Rscript 03_run_dre_models_FINAL.R <model_name>
+#### Valid model names: DRE1i  DRE2i  DRE3i
+#### ============================================================
+
+.libPaths(c("~/Rlibs_4.1.2", .libPaths()))
+Sys.setenv(R_HOME = R.home())
+
+library(brms)
+library(rstan)
+library(dplyr)
+library(splines)
+
+options(mc.cores = 4)
+rstan::rstan_options(auto_write = TRUE)
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) != 1) stop("Usage: Rscript 03_run_dre_models_FINAL.R <DRE1i|DRE2i|DRE3i>")
+model_name <- args[1]
+
+valid_models <- c("DRE1i", "DRE2i", "DRE3i")
+if (!model_name %in% valid_models) {
+  stop("Invalid model name: ", model_name, ". Valid options: ", paste(valid_models, collapse = ", "))
+}
+
+data_dir <- "Data/Processed/Final_Invert_Models_v2"
+base_out_dir <- "completed_models/DRE_final"
+out_dir <- file.path(base_out_dir, model_name)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create("Logs", showWarnings = FALSE)
+
+data_files <- c(
+  DRE1i = "DRE1i_TotalRichnessBaseline_data.rds",
+  DRE2i = "DRE2i_NativeRichnessBaseline_data.rds",
+  DRE3i = "DRE3i_PropTotalBaseline_data.rds"
+)
+data_path <- file.path(data_dir, data_files[[model_name]])
+if (!file.exists(data_path)) stop("Data file not found: ", data_path)
+dat <- readRDS(data_path)
+
+#### Sanity check -- confirms this data was built with the fixed
+#### sample_year handling (see 02_prepare_dre_data_v2_FINAL.R header)
+cat("\nsample_year range:", paste(range(as.integer(as.character(dat$sample_year))), collapse = "-"), "\n")
+
+cat("\n============================================================\n")
+cat("Fitting:", model_name, "\n")
+cat("============================================================\n")
+
+if (model_name %in% c("DRE1i", "DRE2i")) {
+
+  #### ---- Native / total taxon richness: full nested RE structure ----
+  dat <- dat %>% mutate(value = as.integer(value))
+
+  SPLINE_DF <- 3
+  form <- bf(as.formula(paste0(
+    "value ~ pre_value * ns(log_years_since_removal, df = ", SPLINE_DF, ") + ",
+    "z_years_pre_to_removal + z_network_distance_km + z_n_amber_barriers_on_path + ",
+    "z_additional_removals_since_event + z_n_removals_before_first_measurement + ",
+    "z_n_prior_removals_at_focal_event + network_direction + ",
+    "z_dist_up + z_dist_mouth + z_log_population_density + z_mean_temp_annual + ",
+    "z_precip_annual + z_log_river_km + ",
+    "(1 | country) + (1 | HYBAS_ID) + (1 | site_id) + (1 | method) + (1 | sample_year)")))
+
+  priors <- c(
+    prior(normal(0, 0.5), class = "b"),
+    prior(normal(3, 2), class = "Intercept"),
+    prior(exponential(1), class = "sd"),
+    prior(exponential(1), class = "shape")
+  )
+
+  fit <- brm(
+    formula = form, data = dat, family = negbinomial(), prior = priors,
+    chains = 4, iter = 4000, warmup = 1000, cores = 4, seed = 3111, refresh = 100,
+    save_pars = save_pars(all = TRUE),
+    control = list(adapt_delta = 0.97, max_treedepth = 15),
+    file = file.path(out_dir, paste0(model_name, "_final")),
+    file_refit = "on_change"
+  )
+
+} else if (model_name == "DRE3i") {
+
+  #### ---- Proportion of non-native taxa: reduced, site-only design ----
+  dat <- dat %>%
+    mutate(non_native = as.integer(non_native), total_taxa = as.integer(total_taxa)) %>%
+    filter(total_taxa > 0)
+
+  form <- bf(
+    non_native | trials(total_taxa) ~ pre_value * ns(log_years_since_removal, df = 2) +
+      z_years_pre_to_removal + z_network_distance_km + z_n_amber_barriers_on_path +
+      z_additional_removals_since_event + network_direction +
+      (1 | site_id)
+  )
+
+  priors <- c(
+    prior(normal(0, 2), class = "b"),
+    prior(normal(-7, 2), class = "Intercept"),
+    prior(exponential(1), class = "sd"),
+    prior(gamma(2, 0.1), class = "phi")
+  )
+
+  fit <- brm(
+    formula = form, data = dat, family = beta_binomial(link = "logit"), prior = priors,
+    chains = 4, iter = 4000, warmup = 1000, cores = 4, seed = 3112, refresh = 100,
+    save_pars = save_pars(all = TRUE),
+    control = list(adapt_delta = 0.95, max_treedepth = 12),
+    file = file.path(out_dir, paste0(model_name, "_final")),
+    file_refit = "on_change"
+  )
+}
+
+#### ---- Diagnostics ----
+cat("\nDivergent transitions:", rstan::get_num_divergent(fit$fit), "\n")
+td <- rstan::get_max_treedepth_iterations(fit$fit)
+cat("Treedepth exceedances:", sum(td), "of", length(td), "\n")
+cat("Max Rhat:", max(brms::rhat(fit)), "\n")
+cat("Min ESS ratio:", min(brms::neff_ratio(fit)), "\n")
+
+write.csv(as.data.frame(fixef(fit)), file.path(out_dir, paste0(model_name, "_fixef.csv")))
+sink(file.path(out_dir, paste0(model_name, "_summary.txt")))
+print(summary(fit))
+sink()
+
+cat("\nFinished:", model_name, "\n")

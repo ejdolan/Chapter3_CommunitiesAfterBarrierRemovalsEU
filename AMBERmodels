@@ -1,0 +1,148 @@
+#### ============================================================
+#### AMBER MODELS — FINAL, AS REPORTED
+#### Chapter 3 — European Connectivity (Invertebrates)
+#### ============================================================
+####
+#### Fits the three AMBER models reported in this chapter:
+####   A2i — Native taxon richness (primary response, Section 3.1.2)
+####   A1i — Total taxon richness (robustness check, Supplementary)
+####   A3i — Proportion of non-native taxa, denominator = total
+####         richness (primary response, Section 3.1.3). Uses the
+####         maximum-treedepth=15 refit settings, since the default
+####         (treedepth=10) run hit the treedepth ceiling on ~100%
+####         of iterations (see Table S4 for the before/after
+####         comparison confirming coefficient stability).
+####
+#### Requires the model-ready .rds files built by
+#### 01_prepare_amber_data_v2_FINAL.R:
+####   A1i_TotalRichnesswithtype_data.rds
+####   A2i_NativeRichnesswithtype_data.rds
+####   A3i_Propwithtype_data.rds
+####
+#### Usage: Rscript 03_run_amber_models_FINAL.R <model_name>
+#### Valid model names: A1i  A2i  A3i
+#### ============================================================
+
+.libPaths(c("~/Rlibs_4.1.2", .libPaths()))
+Sys.setenv(R_HOME = R.home())
+
+library(brms)
+library(rstan)
+library(dplyr)
+
+options(mc.cores = 4)
+rstan::rstan_options(auto_write = TRUE)
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) != 1) stop("Usage: Rscript 03_run_amber_models_FINAL.R <A1i|A2i|A3i>")
+model_name <- args[1]
+
+valid_models <- c("A1i", "A2i", "A3i")
+if (!model_name %in% valid_models) {
+  stop("Invalid model name: ", model_name, ". Valid options: ", paste(valid_models, collapse = ", "))
+}
+
+data_dir <- "Data/Processed/Final_Invert_Models_v2"
+base_out_dir <- "completed_models/AMBER_final"
+out_dir <- file.path(base_out_dir, model_name)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create("Logs", showWarnings = FALSE)
+
+data_files <- c(
+  A1i = "A1i_TotalRichnesswithtype_data.rds",
+  A2i = "A2i_NativeRichnesswithtype_data.rds",
+  A3i = "A3i_Propwithtype_data.rds"
+)
+data_path <- file.path(data_dir, data_files[[model_name]])
+if (!file.exists(data_path)) stop("Data file not found: ", data_path)
+dat <- readRDS(data_path)
+
+cat("\n============================================================\n")
+cat("Fitting:", model_name, "\n")
+cat("============================================================\n")
+
+#### ---- Shared covariate set (all three AMBER models) ----
+covariate_formula <- paste(
+  "z_barrier_density * barrier_type_reduced +",
+  "z_dist_up + z_dist_mouth + z_log_population_density +",
+  "z_mean_temp_annual + z_precip_annual + z_log_river_km +",
+  "(1 | country) + (1 | HYBAS_ID) + (1 | site_id) + (1 | method) + (1 | sample_year)"
+)
+
+if (model_name %in% c("A1i", "A2i")) {
+
+  #### ---- Native / total taxon richness ----
+  dat <- dat %>%
+    mutate(country = factor(country), HYBAS_ID = factor(HYBAS_ID),
+           site_id = factor(site_id), method = factor(method),
+           sample_year = factor(sample_year),
+           barrier_type_reduced = relevel(factor(barrier_type_reduced), ref = "other"),
+           value = as.integer(value))
+
+  form <- bf(as.formula(paste("value ~", covariate_formula)))
+
+  priors <- c(
+    prior(normal(0, 0.5), class = "b"),
+    prior(normal(3, 2), class = "Intercept"),
+    prior(exponential(1), class = "sd"),
+    prior(exponential(1), class = "shape")
+  )
+
+  fit <- brm(
+    formula = form, data = dat, family = negbinomial(), prior = priors,
+    chains = 4, iter = 3000, warmup = 1000, cores = 4, seed = 2101, refresh = 100,
+    save_pars = save_pars(all = TRUE),
+    control = list(adapt_delta = 0.95, max_treedepth = 10),
+    file = file.path(out_dir, paste0(model_name, "_final")),
+    file_refit = "on_change"
+  )
+
+} else if (model_name == "A3i") {
+
+  #### ---- Proportion of non-native taxa (denominator = total richness) ----
+  #### Uses max_treedepth = 15: the default (10) run hit the treedepth
+  #### ceiling on effectively all post-warmup iterations. Refitting at
+  #### 15 fully resolved this (0 of 8000 exceedances); coefficients
+  #### shifted by <0.007 relative to the default-settings fit (Table S4).
+  dat <- dat %>%
+    mutate(country = factor(country), HYBAS_ID = factor(HYBAS_ID),
+           site_id = factor(site_id), method = factor(method),
+           sample_year = factor(sample_year),
+           barrier_type_reduced = relevel(factor(barrier_type_reduced), ref = "other"),
+           non_native = as.integer(non_native), total_taxa = as.integer(total_taxa)) %>%
+    filter(total_taxa > 0)
+
+  form <- bf(as.formula(paste(
+    "non_native | trials(total_taxa) + weights(obs_weight) ~", covariate_formula
+  )))
+
+  priors <- c(
+    prior(normal(0, 0.5), class = "b"),
+    prior(normal(-6, 2), class = "Intercept"),
+    prior(exponential(1), class = "sd"),
+    prior(gamma(2, 0.1), class = "phi")
+  )
+
+  fit <- brm(
+    formula = form, data = dat, family = beta_binomial(link = "logit"), prior = priors,
+    chains = 4, iter = 3000, warmup = 1000, cores = 4, seed = 1303, refresh = 100,
+    save_pars = save_pars(all = TRUE),
+    control = list(adapt_delta = 0.95, max_treedepth = 15),
+    file = file.path(out_dir, paste0(model_name, "_final")),
+    file_refit = "on_change"
+  )
+}
+
+#### ---- Diagnostics ----
+cat("\nDivergent transitions:", rstan::get_num_divergent(fit$fit), "\n")
+td <- rstan::get_max_treedepth_iterations(fit$fit)
+cat("Treedepth exceedances:", sum(td), "of", length(td), "\n")
+cat("Max Rhat:", max(brms::rhat(fit)), "\n")
+cat("Min ESS ratio:", min(brms::neff_ratio(fit)), "\n")
+
+write.csv(as.data.frame(fixef(fit)), file.path(out_dir, paste0(model_name, "_fixef.csv")))
+sink(file.path(out_dir, paste0(model_name, "_summary.txt")))
+print(summary(fit))
+sink()
+
+cat("\nFinished:", model_name, "\n")
